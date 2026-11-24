@@ -5,7 +5,9 @@ import os
 import struct
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from common.cursor import Cursor
 
 RECORD_HEADER_FORMAT = "!I"
 RECORD_HEADER_SIZE = struct.calcsize(RECORD_HEADER_FORMAT)
@@ -47,6 +49,9 @@ class LogManager:
 
     def _meta_path(self, topic: str) -> str:
         return os.path.join(self.data_dir, f"{topic}.meta.json")
+
+    def _cursor_path(self, topic: str, subscription: str) -> str:
+        return os.path.join(self.data_dir, f"{topic}_{subscription}.cursor.json")
 
     def _log_path(self, topic: str) -> str:
         return os.path.join(self.data_dir, f"{topic}.log")
@@ -232,6 +237,102 @@ class LogManager:
         with self._lock:
             self._ensure_topic_initialized(topic)
             return self._highest_tokens.get(topic, 0)
+
+    def save_cursor(self, topic: str, subscription: str, cursor: Cursor, fencing_token: int) -> None:
+        """Saves subscription cursor durably to disk with fsync and fencing check.
+        
+        Args:
+            topic: Topic name.
+            subscription: Subscription identifier.
+            cursor: The Cursor object containing mark_delete_position and individual_acks.
+            fencing_token: The broker's fencing token.
+            
+        Raises:
+            FencedError: If broker's fencing token is lower than storage highest token.
+        """
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+
+            current_token = self._highest_tokens.get(topic, 0)
+            if fencing_token < current_token:
+                raise FencedError(
+                    f"Fenced: broker token {fencing_token} is stale. Highest known token is {current_token}.",
+                    current_token=current_token,
+                    attempted_token=fencing_token
+                )
+
+            if fencing_token > current_token:
+                self._highest_tokens[topic] = fencing_token
+                self._persist_meta(topic)
+
+            cursor_file = self._cursor_path(topic, subscription)
+            temp_file = f"{cursor_file}.tmp"
+            data = cursor.to_dict()
+            data["topic"] = topic
+            data["subscription"] = subscription
+            data["updated_at"] = time.time()
+
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, cursor_file)
+
+    def load_cursor(self, topic: str, subscription: str) -> Cursor:
+        """Loads subscription cursor from disk. Returns default Cursor if none exists."""
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+            cursor_file = self._cursor_path(topic, subscription)
+            if not os.path.exists(cursor_file):
+                return Cursor(mark_delete_position=-1, individual_acks=set())
+
+            try:
+                with open(cursor_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return Cursor.from_dict(data)
+            except Exception:
+                return Cursor(mark_delete_position=-1, individual_acks=set())
+
+    def save_topic_metadata(self, topic: str, metadata: Dict[str, Any]) -> None:
+        """Persists topic metadata such as subscription list and retention settings."""
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+            meta_file = self._meta_path(topic)
+            existing = {}
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+
+            existing.update(metadata)
+            existing["topic"] = topic
+            existing["highest_fencing_token"] = self._highest_tokens.get(topic, 0)
+
+            temp_file = f"{meta_file}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(existing, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, meta_file)
+
+    def get_topic_metadata(self, topic: str) -> Dict[str, Any]:
+        """Retrieves topic metadata."""
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+            meta_file = self._meta_path(topic)
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+            return {
+                "topic": topic,
+                "highest_fencing_token": self._highest_tokens.get(topic, 0),
+                "subscriptions": []
+            }
 
     def close(self) -> None:
         """Flushes and closes all open file handles."""

@@ -3,6 +3,7 @@
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from common.cursor import Cursor
 from common.protocol import Commands, ErrorCodes
 from common.tcp_service import TCPClient
 from storage.log_manager import FencedError
@@ -108,4 +109,55 @@ class StorageClient:
             raise RuntimeError(f"Storage last_offset failed: {resp.get('message')}")
 
         return int(resp.get("last_offset", -1))
+
+    def save_cursor(self, topic: str, subscription: str, cursor: Cursor, fencing_token: int) -> None:
+        """Persists a subscription cursor position to the storage node.
+        
+        Raises:
+            FencedError: If the broker's fencing token is stale.
+            RuntimeError: For other errors.
+        """
+        if not self._tcp_client:
+            raise ConnectionError("StorageClient is not connected.")
+
+        req_id = str(uuid.uuid4())
+        req = {
+            "type": Commands.SAVE_CURSOR,
+            "req_id": req_id,
+            "topic": topic,
+            "subscription": subscription,
+            "mark_delete_offset": cursor.mark_delete_position,
+            "individual_acks": sorted(list(cursor.individual_acks)),
+            "fencing_token": fencing_token
+        }
+        resp = self._tcp_client.send_request(req)
+
+        if resp.get("type") == Commands.ERROR:
+            err_code = resp.get("error_code")
+            msg = resp.get("message", "Unknown storage error")
+            if err_code == ErrorCodes.FENCED:
+                raise FencedError(msg, current_token=-1, attempted_token=fencing_token)
+            raise RuntimeError(f"Storage save_cursor failed [{err_code}]: {msg}")
+
+    def load_cursor(self, topic: str, subscription: str) -> Cursor:
+        """Retrieves the subscription cursor position from the storage node."""
+        if not self._tcp_client:
+            raise ConnectionError("StorageClient is not connected.")
+
+        req_id = str(uuid.uuid4())
+        req = {
+            "type": Commands.LOAD_CURSOR,
+            "req_id": req_id,
+            "topic": topic,
+            "subscription": subscription
+        }
+        resp = self._tcp_client.send_request(req)
+
+        if resp.get("type") == Commands.ERROR:
+            raise RuntimeError(f"Storage load_cursor failed: {resp.get('message')}")
+
+        return Cursor(
+            mark_delete_position=int(resp.get("mark_delete_offset", -1)),
+            individual_acks=set(int(x) for x in resp.get("individual_acks", []))
+        )
 

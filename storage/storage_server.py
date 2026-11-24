@@ -3,6 +3,7 @@
 from typing import Any, Dict, Optional
 import socket
 
+from common.cursor import Cursor
 from common.protocol import Commands, ErrorCodes, make_error, make_ok
 from common.tcp_service import BaseTCPServer
 from storage.log_manager import FencedError, LogManager
@@ -63,6 +64,45 @@ class StorageServer(BaseTCPServer):
             try:
                 offset = self.log_manager.last_offset(topic)
                 return make_ok(req_id, Commands.LAST_OFFSET_OK, topic=topic, last_offset=offset)
+            except Exception as e:
+                return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
+
+        elif cmd == Commands.SAVE_CURSOR:
+            topic = request.get("topic")
+            subscription = request.get("subscription")
+            fencing_token = request.get("fencing_token")
+            mark_delete_offset = request.get("mark_delete_offset", -1)
+            individual_acks = set(request.get("individual_acks", []))
+
+            if not topic or not subscription or fencing_token is None:
+                return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic, subscription, or fencing_token")
+
+            try:
+                cursor = Cursor(mark_delete_position=int(mark_delete_offset), individual_acks=individual_acks)
+                self.log_manager.save_cursor(topic, subscription, cursor, int(fencing_token))
+                return make_ok(req_id, Commands.SAVE_CURSOR_OK, topic=topic, subscription=subscription)
+            except FencedError as e:
+                return make_error(req_id, ErrorCodes.FENCED, str(e))
+            except Exception as e:
+                return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
+
+        elif cmd == Commands.LOAD_CURSOR:
+            topic = request.get("topic")
+            subscription = request.get("subscription")
+
+            if not topic or not subscription:
+                return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic or subscription")
+
+            try:
+                cursor = self.log_manager.load_cursor(topic, subscription)
+                return make_ok(
+                    req_id,
+                    Commands.LOAD_CURSOR_OK,
+                    topic=topic,
+                    subscription=subscription,
+                    mark_delete_offset=cursor.mark_delete_position,
+                    individual_acks=sorted(list(cursor.individual_acks))
+                )
             except Exception as e:
                 return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
 
