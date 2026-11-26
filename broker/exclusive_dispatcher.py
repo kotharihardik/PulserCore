@@ -10,6 +10,7 @@ from common.framing import write_frame
 from common.logger import setup_logger
 from common.protocol import Commands, MessageId
 from broker.unacked_tracker import UnackedTracker
+from storage.log_manager import FencedError
 from storage.storage_client import StorageClient
 
 
@@ -153,6 +154,9 @@ class ExclusiveDispatcher(BaseDispatcher):
             self.logger.debug(
                 f"Checkpointed cursor {self.subscription_name} at offset {self.cursor.mark_delete_position}"
             )
+        except FencedError as e:
+            self.logger.error(f"ExclusiveDispatcher fenced out while saving cursor: {e}")
+            self._is_running.clear()
         except Exception as e:
             self.logger.error(f"Failed to save cursor to storage: {e}")
 

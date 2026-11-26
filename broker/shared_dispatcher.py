@@ -11,6 +11,7 @@ from common.framing import write_frame
 from common.logger import setup_logger
 from common.protocol import Commands, MessageId
 from broker.unacked_tracker import UnackedTracker
+from storage.log_manager import FencedError
 from storage.storage_client import StorageClient
 
 
@@ -187,6 +188,9 @@ class SharedDispatcher(BaseDispatcher):
             self.logger.debug(
                 f"Checkpointed shared cursor {self.subscription_name} at mark-delete {self.cursor.mark_delete_position}"
             )
+        except FencedError as e:
+            self.logger.error(f"SharedDispatcher fenced out while saving cursor: {e}")
+            self._is_running.clear()
         except Exception as e:
             self.logger.error(f"Failed to save shared cursor: {e}")
 
