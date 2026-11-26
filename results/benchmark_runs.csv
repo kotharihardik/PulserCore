@@ -1,0 +1,13 @@
+run_id,scenario,mode,total_published,unique_delivered,redelivered_count,duplicates_seen,recovery_latency_ms,publish_recovery_ms,deliver_recovery_ms,throughput_msgs_per_sec,ordering_preserved,zombie_fenced,notes
+1,consumer_crash_exclusive,EXCLUSIVE,60,60,5,5,11.91,0.0,11.91,54.8,True,False,c1 crashed holding 5 unacked; c2 recovered 45 msgs
+1,consumer_crash_shared,SHARED,60,60,11,11,0.31,0.0,0.31,53.46,False,False,c1 crashed holding 5 unacked; c2 recovered 51 msgs
+1,broker_kill_sigkill,EXCLUSIVE,80,80,0,0,699.54,696.69,699.54,30.45,True,False,killed broker-1; failover to broker-3 (token=2)
+1,broker_zombie_sigstop,EXCLUSIVE,40,40,0,0,2264.36,2255.39,2264.36,8.76,True,True,SIGSTOP broker-1(tok=1) -> broker-3(tok=2); SIGCONT rejected=FENCED
+2,consumer_crash_exclusive,EXCLUSIVE,60,60,5,5,12.75,0.0,12.75,54.77,True,False,c1 crashed holding 5 unacked; c2 recovered 45 msgs
+2,consumer_crash_shared,SHARED,60,60,11,11,0.24,0.0,0.24,55.83,False,False,c1 crashed holding 5 unacked; c2 recovered 51 msgs
+2,broker_kill_sigkill,EXCLUSIVE,80,80,0,0,702.69,687.51,702.69,30.43,True,False,killed broker-1; failover to broker-3 (token=2)
+2,broker_zombie_sigstop,EXCLUSIVE,40,40,0,0,2598.06,2591.63,2598.06,7.62,True,True,SIGSTOP broker-1(tok=1) -> broker-2(tok=2); SIGCONT rejected=FENCED
+3,consumer_crash_exclusive,EXCLUSIVE,60,60,5,5,1018.72,0.0,1018.72,42.28,True,False,c1 crashed holding 5 unacked; c2 recovered 45 msgs
+3,consumer_crash_shared,SHARED,60,60,11,11,3.2,0.0,3.2,53.87,False,False,c1 crashed holding 5 unacked; c2 recovered 51 msgs
+3,broker_kill_sigkill,EXCLUSIVE,80,80,0,0,711.9,700.63,711.9,30.53,True,False,killed broker-1; failover to broker-3 (token=2)
+3,broker_zombie_sigstop,EXCLUSIVE,40,40,0,0,2552.79,2542.62,2552.79,7.78,True,True,SIGSTOP broker-1(tok=1) -> broker-2(tok=2); SIGCONT rejected=NOT_OWNER

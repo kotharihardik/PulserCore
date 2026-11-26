@@ -1,0 +1,5 @@
+scenario,runs,mode,mean_recovery_ms,min_recovery_ms,max_recovery_ms,stdev_recovery_ms,mean_redeliveries,mean_duplicates,mean_throughput_msg_s,total_lost_messages,ordering_preserved_all_runs,zombie_fenced_all_runs
+consumer_crash_exclusive,3,EXCLUSIVE,347.79,11.91,1018.72,581.04,5.00,5.00,50.62,0,True,False
+consumer_crash_shared,3,SHARED,1.25,0.24,3.20,1.69,11.00,11.00,54.39,0,False,False
+broker_kill_sigkill,3,EXCLUSIVE,704.71,699.54,711.90,6.42,0.00,0.00,30.47,0,True,False
+broker_zombie_sigstop,3,EXCLUSIVE,2471.74,2264.36,2598.06,181.01,0.00,0.00,8.05,0,True,True

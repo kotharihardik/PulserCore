@@ -183,6 +183,37 @@ Broker retrieves subscription state on startup or topic takeover.
 }
 ```
 
+#### `SET_RETENTION` & `APPLY_RETENTION` (Configure and execute retention cleanup)
+```json
+{
+  "type": "SET_RETENTION",
+  "req_id": "5a",
+  "topic": "orders",
+  "retention_time_sec": 3600,
+  "retention_size_bytes": 1048576
+}
+```
+```json
+{
+  "type": "APPLY_RETENTION",
+  "req_id": "5b",
+  "topic": "orders"
+}
+```
+**Response: `APPLY_RETENTION_OK`**
+```json
+{
+  "type": "APPLY_RETENTION_OK",
+  "req_id": "5b",
+  "topic": "orders",
+  "deleted_count": 50,
+  "new_base_offset": 50,
+  "remaining_count": 100,
+  "remaining_bytes": 12400,
+  "safe_acked_upto": 80
+}
+```
+
 ---
 
 ### 4.2 Coordinator API (Broker/Client <---> Coordinator)

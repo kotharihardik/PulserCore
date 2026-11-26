@@ -1,0 +1,5 @@
+run_id,scenario,mode,total_published,unique_delivered,redelivered_count,duplicates_seen,recovery_latency_ms,publish_recovery_ms,deliver_recovery_ms,throughput_msgs_per_sec,ordering_preserved,zombie_fenced,notes
+1,consumer_crash_exclusive,EXCLUSIVE,60,60,5,5,12.27,0.0,12.27,53.74,True,False,c1 crashed holding 5 unacked; c2 recovered 45 msgs
+1,consumer_crash_shared,SHARED,60,60,11,11,0.14,0.0,0.14,53.38,False,False,c1 crashed holding 5 unacked; c2 recovered 51 msgs
+1,broker_kill_sigkill,EXCLUSIVE,80,80,0,0,704.83,697.79,704.83,29.8,True,False,killed broker-1; failover to broker-3 (token=2)
+1,broker_zombie_sigstop,EXCLUSIVE,40,40,0,0,2562.11,2550.69,2562.11,7.74,True,True,SIGSTOP broker-1(tok=1) -> broker-2(tok=2); SIGCONT rejected=FENCED
