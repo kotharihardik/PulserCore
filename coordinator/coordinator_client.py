@@ -35,7 +35,13 @@ class CoordinatorClient:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def acquire_lease(self, topic: str, broker_id: str, lease_ttl_ms: int = 5000) -> Tuple[int, float]:
+    def acquire_lease(
+        self,
+        topic: str,
+        broker_id: str,
+        lease_ttl_ms: int = 5000,
+        broker_address: Optional[str] = None
+    ) -> Tuple[int, float]:
         """Requests topic ownership.
         
         Returns:
@@ -53,7 +59,8 @@ class CoordinatorClient:
             "req_id": req_id,
             "topic": topic,
             "broker_id": broker_id,
-            "lease_ttl_ms": lease_ttl_ms
+            "lease_ttl_ms": lease_ttl_ms,
+            "broker_address": broker_address
         }
         resp = self._tcp_client.send_request(req)
 
@@ -122,6 +129,7 @@ class CoordinatorClient:
             return None
         return {
             "broker_id": resp.get("broker_id"),
+            "broker_address": resp.get("broker_address"),
             "fencing_token": resp.get("fencing_token"),
             "expires_at": resp.get("expires_at")
         }

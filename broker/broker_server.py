@@ -1,7 +1,8 @@
-"""Broker Server handling producer publishing, subscriptions, and dispatch routing."""
+"""Broker Server handling producer publishing, subscriptions, dispatch routing, and topic leases."""
 
 import socket
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from broker.exclusive_dispatcher import ExclusiveDispatcher
@@ -17,18 +18,28 @@ from common.protocol import (
     make_ok,
 )
 from common.tcp_service import BaseTCPServer
+from coordinator.coordinator_client import CoordinatorClient
+from coordinator.lease_manager import LeaseError
 from storage.log_manager import FencedError
 from storage.storage_client import StorageClient
 
 
+class NotOwnerError(Exception):
+    """Raised when this broker does not hold the active lease for a topic."""
+    def __init__(self, message: str, owner_address: Optional[str] = None):
+        super().__init__(message)
+        self.owner_address = owner_address
+
+
 class BrokerServer(BaseTCPServer):
-    """Stateless messaging broker node.
+    """Stateless messaging broker node with lease-based topic ownership.
     
     Responsibilities:
-    - Accepts producer connections (PUBLISH) and writes to storage.
-    - Accepts consumer connections (SUBSCRIBE) and assigns them to dispatchers.
-    - Manages Exclusive (and Shared) dispatchers with cursor persistence.
-    - Routes ACKs from consumers back to the appropriate dispatcher.
+    - Acquires and renews time-bound topic leases from the Ownership Coordinator.
+    - Watches standby topics and safely takes over with a higher fencing token (N+1) on failover.
+    - Rebuilds topic state (last offset, durable cursors) from decoupled Storage on takeover.
+    - Accepts producer connections (PUBLISH) and consumer connections (SUBSCRIBE/ACK).
+    - Relinquishes ownership locally if fenced out by Storage or if lease renewal fails.
     """
 
     def __init__(
@@ -39,15 +50,39 @@ class BrokerServer(BaseTCPServer):
         storage_port: int,
         broker_id: str = "broker-1",
         fencing_token: int = 1,
+        ack_timeout_sec: float = 3.0,
+        coordinator_host: Optional[str] = None,
+        coordinator_port: Optional[int] = None,
+        lease_ttl_ms: int = 2000,
+        renew_interval_sec: Optional[float] = None,
+        watch_topics: Optional[List[str]] = None,
         name: str = "BrokerService"
     ):
         super().__init__(host, port, name=name)
         self.broker_id = broker_id
         self.fencing_token = fencing_token
+        self.ack_timeout_sec = ack_timeout_sec
         self.storage_host = storage_host
         self.storage_port = storage_port
 
+        # Coordinator settings (None = legacy single-broker static ownership mode)
+        self.coordinator_host = coordinator_host
+        self.coordinator_port = coordinator_port
+        self.lease_ttl_ms = lease_ttl_ms
+        self.renew_interval_sec = (
+            renew_interval_sec
+            if renew_interval_sec is not None
+            else max(0.05, (lease_ttl_ms / 1000.0) / 3.0)
+        )
+        self.watch_topics: List[str] = list(watch_topics) if watch_topics else []
+
         self.storage_client: Optional[StorageClient] = None
+        self.coordinator_client: Optional[CoordinatorClient] = None
+
+        self._topic_lock = threading.Lock()
+        # topic -> active fencing token held by this broker
+        self._topic_tokens: Dict[str, int] = {}
+        self._lease_thread: Optional[threading.Thread] = None
 
         self._dispatcher_lock = threading.Lock()
         # (topic, subscription) -> BaseDispatcher
@@ -55,13 +90,155 @@ class BrokerServer(BaseTCPServer):
         # socket -> [(topic, subscription, consumer_id)]
         self._socket_consumers: Dict[socket.socket, List[Tuple[str, str, str]]] = {}
 
+    @property
+    def coordinator_enabled(self) -> bool:
+        return self.coordinator_host is not None and self.coordinator_port is not None
+
+    @property
+    def address(self) -> str:
+        return f"{self.host}:{self.port}"
+
     def start(self) -> int:
-        """Starts storage connection and begins listening for client connections."""
+        """Starts storage & coordinator connections and begins listening for client traffic."""
         self.storage_client = StorageClient(self.storage_host, self.storage_port)
         self.storage_client.connect()
+
+        if self.coordinator_enabled:
+            self.coordinator_client = CoordinatorClient(self.coordinator_host, self.coordinator_port)
+            self.coordinator_client.connect()
+
         bound_port = super().start()
-        self.logger.info(f"Broker {self.broker_id} connected to storage at {self.storage_host}:{self.storage_port}")
+
+        if self.coordinator_enabled:
+            self._lease_thread = threading.Thread(
+                target=self._lease_maintenance_loop,
+                name=f"{self.name}-LeaseLoop",
+                daemon=True
+            )
+            self._lease_thread.start()
+
+        self.logger.info(
+            f"Broker {self.broker_id} listening at {self.address} "
+            f"(storage={self.storage_host}:{self.storage_port}, coordinator={self.coordinator_enabled})"
+        )
         return bound_port
+
+    def acquire_topic(self, topic: str) -> int:
+        """Acquires ownership lease for `topic` and rebuilds topic state from Storage."""
+        if not self.coordinator_enabled or not self.coordinator_client:
+            return self.fencing_token
+
+        try:
+            token, _ = self.coordinator_client.acquire_lease(
+                topic=topic,
+                broker_id=self.broker_id,
+                lease_ttl_ms=self.lease_ttl_ms,
+                broker_address=self.address
+            )
+        except LeaseError as e:
+            owner = self.coordinator_client.get_owner(topic)
+            owner_addr = owner.get("broker_address") if owner else None
+            raise NotOwnerError(str(e), owner_address=owner_addr) from e
+
+        with self._topic_lock:
+            prev_token = self._topic_tokens.get(topic)
+            self._topic_tokens[topic] = token
+            if topic not in self.watch_topics:
+                self.watch_topics.append(topic)
+
+        # Rebuild state from storage on takeover
+        last_off = self.storage_client.last_offset(topic) if self.storage_client else -1
+        if prev_token != token:
+            self.logger.info(
+                f"Broker {self.broker_id} acquired topic '{topic}' with fencing_token={token} "
+                f"(rebuilt last_offset={last_off})"
+            )
+            # Update token on any existing dispatchers or clear stale ones
+            with self._dispatcher_lock:
+                for (t, _sub), disp in self._dispatchers.items():
+                    if t == topic:
+                        disp.fencing_token = token
+
+        return token
+
+    def get_owned_token(self, topic: str) -> Optional[int]:
+        """Returns the broker's current fencing token for `topic`, or None if not owned."""
+        if not self.coordinator_enabled:
+            return self.fencing_token
+        with self._topic_lock:
+            return self._topic_tokens.get(topic)
+
+    def _ensure_topic_owned(self, topic: str) -> int:
+        """Returns active fencing token for `topic`, acquiring the lease if unowned."""
+        if not self.coordinator_enabled:
+            return self.fencing_token
+
+        with self._topic_lock:
+            token = self._topic_tokens.get(topic)
+        if token is not None:
+            return token
+
+        return self.acquire_topic(topic)
+
+    def _demote_topic(self, topic: str, reason: str) -> None:
+        """Relinquishes local ownership and stops dispatchers for `topic`."""
+        with self._topic_lock:
+            removed = self._topic_tokens.pop(topic, None)
+
+        if removed is not None:
+            self.logger.warning(f"Broker {self.broker_id} demoted from topic '{topic}': {reason}")
+
+        with self._dispatcher_lock:
+            keys_to_close = [k for k in self._dispatchers if k[0] == topic]
+            for key in keys_to_close:
+                disp = self._dispatchers.pop(key)
+                try:
+                    disp.close()
+                except Exception:
+                    pass
+
+    def _lease_maintenance_loop(self) -> None:
+        """Background loop renewing owned leases and watching standby topics for failover."""
+        while self._is_running.is_set():
+            time.sleep(self.renew_interval_sec)
+            if not self._is_running.is_set() or not self.coordinator_client:
+                break
+
+            # 1. Renew all currently owned topic leases
+            with self._topic_lock:
+                owned_snapshot = list(self._topic_tokens.items())
+
+            for topic, token in owned_snapshot:
+                if not self._is_running.is_set():
+                    break
+                try:
+                    self.coordinator_client.renew_lease(
+                        topic=topic,
+                        broker_id=self.broker_id,
+                        token=token,
+                        lease_ttl_ms=self.lease_ttl_ms
+                    )
+                except LeaseError as e:
+                    self._demote_topic(topic, f"lease renewal rejected ({e})")
+                except Exception as e:
+                    self.logger.error(f"Error renewing lease for '{topic}': {e}")
+
+            # 2. Watch standby topics and take over if owner's lease expired
+            with self._topic_lock:
+                unowned_watched = [t for t in self.watch_topics if t not in self._topic_tokens]
+
+            for topic in unowned_watched:
+                if not self._is_running.is_set():
+                    break
+                try:
+                    owner = self.coordinator_client.get_owner(topic)
+                    if owner is None:
+                        self.acquire_topic(topic)
+                except NotOwnerError:
+                    # Another standby broker won the race cleanly
+                    pass
+                except Exception as e:
+                    self.logger.debug(f"Standby watch check failed for '{topic}': {e}")
 
     def handle_connection(self, client_sock: socket.socket, client_addr: Tuple[str, int]) -> None:
         """Custom connection loop that cleans up subscriptions on client disconnect."""
@@ -110,7 +287,8 @@ class BrokerServer(BaseTCPServer):
             return make_error(req_id, ErrorCodes.INTERNAL_ERROR, "Broker not connected to storage")
 
         try:
-            offset = self.storage_client.append(topic, payload, fencing_token=self.fencing_token)
+            token = self._ensure_topic_owned(topic)
+            offset = self.storage_client.append(topic, payload, fencing_token=token)
             msg_id = MessageId(topic=topic, offset=offset)
 
             return make_ok(
@@ -119,8 +297,14 @@ class BrokerServer(BaseTCPServer):
                 topic=topic,
                 message_id=msg_id.to_dict()
             )
+        except NotOwnerError as e:
+            err = make_error(req_id, ErrorCodes.NOT_OWNER, str(e))
+            if e.owner_address:
+                err["owner_address"] = e.owner_address
+            return err
         except FencedError as e:
-            self.logger.error(f"Broker {self.broker_id} was fenced out: {e}")
+            self.logger.error(f"Broker {self.broker_id} was fenced out on '{topic}': {e}")
+            self._demote_topic(topic, f"fenced by storage ({e})")
             return make_error(req_id, ErrorCodes.FENCED, f"Broker fenced out: {e}")
         except Exception as e:
             self.logger.exception(f"Unexpected error publishing message: {e}")
@@ -140,6 +324,14 @@ class BrokerServer(BaseTCPServer):
         if not topic or not subscription:
             return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic or subscription")
 
+        try:
+            token = self._ensure_topic_owned(topic)
+        except NotOwnerError as e:
+            err = make_error(req_id, ErrorCodes.NOT_OWNER, str(e))
+            if e.owner_address:
+                err["owner_address"] = e.owner_address
+            return err
+
         key = (topic, subscription)
         with self._dispatcher_lock:
             dispatcher = self._dispatchers.get(key)
@@ -149,7 +341,8 @@ class BrokerServer(BaseTCPServer):
                         topic=topic,
                         subscription_name=subscription,
                         storage_client=self.storage_client,
-                        fencing_token=self.fencing_token
+                        fencing_token=token,
+                        ack_timeout_sec=self.ack_timeout_sec
                     )
                     self._dispatchers[key] = dispatcher
                 elif mode == SubscriptionModes.SHARED:
@@ -157,7 +350,8 @@ class BrokerServer(BaseTCPServer):
                         topic=topic,
                         subscription_name=subscription,
                         storage_client=self.storage_client,
-                        fencing_token=self.fencing_token
+                        fencing_token=token,
+                        ack_timeout_sec=self.ack_timeout_sec
                     )
                     self._dispatchers[key] = dispatcher
                 else:
@@ -192,6 +386,9 @@ class BrokerServer(BaseTCPServer):
         if not topic or not subscription or not msg_id_data:
             return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic, subscription, or message_id")
 
+        if self.coordinator_enabled and self.get_owned_token(topic) is None:
+            return make_error(req_id, ErrorCodes.NOT_OWNER, f"Broker {self.broker_id} no longer owns '{topic}'")
+
         key = (topic, subscription)
         with self._dispatcher_lock:
             dispatcher = self._dispatchers.get(key)
@@ -212,9 +409,17 @@ class BrokerServer(BaseTCPServer):
         else:
             return make_error(req_id, ErrorCodes.BAD_REQUEST, "Failed to process ack")
 
-    def stop(self) -> None:
-        """Shuts down broker, closes all dispatchers, and closes storage client."""
+    def crash(self) -> None:
+        """Simulates an abrupt process crash (stops server without releasing coordinator leases)."""
+        self.stop(release_leases=False)
+
+    def stop(self, release_leases: bool = True) -> None:
+        """Shuts down broker, closes dispatchers, and optionally releases coordinator leases."""
         super().stop()
+
+        if self._lease_thread and self._lease_thread.is_alive():
+            self._lease_thread.join(timeout=1.0)
+
         with self._dispatcher_lock:
             for dispatcher in self._dispatchers.values():
                 try:
@@ -222,6 +427,23 @@ class BrokerServer(BaseTCPServer):
                 except Exception:
                     pass
             self._dispatchers.clear()
+
+        if release_leases and self.coordinator_enabled and self.coordinator_client:
+            with self._topic_lock:
+                owned = list(self._topic_tokens.items())
+                self._topic_tokens.clear()
+            for topic, token in owned:
+                try:
+                    self.coordinator_client.release_lease(topic, self.broker_id, token)
+                except Exception:
+                    pass
+
+        if self.coordinator_client:
+            try:
+                self.coordinator_client.close()
+            except Exception:
+                pass
+            self.coordinator_client = None
 
         if self.storage_client:
             try:

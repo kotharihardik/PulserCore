@@ -60,13 +60,20 @@ class LeaseManager:
     def _is_lease_active(self, lease: Dict[str, Any], current_time: float) -> bool:
         return lease is not None and lease.get("expires_at", 0) > current_time
 
-    def acquire(self, topic: str, broker_id: str, lease_ttl_ms: int = 5000) -> Tuple[int, float]:
+    def acquire(
+        self,
+        topic: str,
+        broker_id: str,
+        lease_ttl_ms: int = 5000,
+        broker_address: Optional[str] = None
+    ) -> Tuple[int, float]:
         """Attempts to acquire exclusive topic ownership lease.
         
         Args:
             topic: The target topic name.
             broker_id: Identifier of the broker requesting ownership.
             lease_ttl_ms: Time-to-live for the lease in milliseconds.
+            broker_address: Optional 'host:port' network address of the broker.
             
         Returns:
             Tuple[int, float]: (fencing_token, expires_at_timestamp)
@@ -83,6 +90,8 @@ class LeaseManager:
                 if existing["broker_id"] == broker_id:
                     expires_at = now + (lease_ttl_ms / 1000.0)
                     existing["expires_at"] = expires_at
+                    if broker_address is not None:
+                        existing["broker_address"] = broker_address
                     return existing["token"], expires_at
                 else:
                     time_left = existing["expires_at"] - now
@@ -99,6 +108,7 @@ class LeaseManager:
             expires_at = now + (lease_ttl_ms / 1000.0)
             self._leases[topic] = {
                 "broker_id": broker_id,
+                "broker_address": broker_address,
                 "token": new_token,
                 "expires_at": expires_at
             }
@@ -170,6 +180,7 @@ class LeaseManager:
                 return {
                     "topic": topic,
                     "broker_id": lease["broker_id"],
+                    "broker_address": lease.get("broker_address"),
                     "fencing_token": lease["token"],
                     "expires_at": lease["expires_at"],
                     "time_to_live_sec": round(lease["expires_at"] - now, 3)

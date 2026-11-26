@@ -23,17 +23,21 @@ class CoordinatorServer(BaseTCPServer):
             topic = request.get("topic")
             broker_id = request.get("broker_id")
             lease_ttl_ms = request.get("lease_ttl_ms", 5000)
+            broker_address = request.get("broker_address")
 
             if not topic or not broker_id:
                 return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic or broker_id")
 
             try:
-                token, expires_at = self.lease_manager.acquire(topic, broker_id, int(lease_ttl_ms))
+                token, expires_at = self.lease_manager.acquire(
+                    topic, broker_id, int(lease_ttl_ms), broker_address=broker_address
+                )
                 return make_ok(
                     req_id,
                     Commands.ACQUIRE_LEASE_OK,
                     topic=topic,
                     broker_id=broker_id,
+                    broker_address=broker_address,
                     fencing_token=token,
                     expires_at=expires_at
                 )
@@ -89,6 +93,7 @@ class CoordinatorServer(BaseTCPServer):
                     Commands.GET_OWNER_OK,
                     topic=topic,
                     broker_id=owner_info["broker_id"],
+                    broker_address=owner_info.get("broker_address"),
                     fencing_token=owner_info["fencing_token"],
                     expires_at=owner_info["expires_at"]
                 )
@@ -98,6 +103,7 @@ class CoordinatorServer(BaseTCPServer):
                     Commands.GET_OWNER_OK,
                     topic=topic,
                     broker_id=None,
+                    broker_address=None,
                     fencing_token=None,
                     expires_at=None
                 )

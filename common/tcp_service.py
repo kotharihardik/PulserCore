@@ -141,6 +141,7 @@ class TCPClient:
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self._rpc_lock = threading.Lock()
 
     def connect(self) -> None:
         """Establishes connection to the target server."""
@@ -149,20 +150,21 @@ class TCPClient:
         self.sock.connect((self.host, self.port))
 
     def send_request(self, request: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
-        """Sends a request frame and synchronously waits for the response frame."""
-        if not self.sock:
-            raise ConnectionError("Client is not connected. Call connect() first.")
+        """Thread-safely sends a request frame and waits for the response frame."""
+        with self._rpc_lock:
+            if not self.sock:
+                raise ConnectionError("Client is not connected. Call connect() first.")
 
-        if timeout is not None:
-            self.sock.settimeout(timeout)
-        else:
-            self.sock.settimeout(self.timeout)
+            if timeout is not None:
+                self.sock.settimeout(timeout)
+            else:
+                self.sock.settimeout(self.timeout)
 
-        write_frame(self.sock, request)
-        response = read_frame(self.sock)
-        if response is None:
-            raise ConnectionError("Server closed connection while waiting for response")
-        return response
+            write_frame(self.sock, request)
+            response = read_frame(self.sock)
+            if response is None:
+                raise ConnectionError("Server closed connection while waiting for response")
+            return response
 
     def send_frame(self, data: Dict[str, Any]) -> None:
         """Sends a single frame without waiting for an immediate response."""

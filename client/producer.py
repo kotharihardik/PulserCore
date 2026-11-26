@@ -1,9 +1,11 @@
-"""Producer client SDK for publishing messages to PulserCore brokers."""
+"""Producer client SDK with topic discovery and automatic failover reconnection."""
 
 import json
+import time
 import uuid
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+from client.discovery import lookup_topic_owner, parse_broker_address
 from common.protocol import Commands, ErrorCodes, MessageId
 from common.tcp_service import TCPClient
 
@@ -19,41 +21,97 @@ class PublishError(Exception):
 class Producer:
     """High-level client SDK for publishing messages to PulserCore brokers.
     
-    Usage:
-        with Producer(broker_host="127.0.0.1", broker_port=5001) as producer:
-            msg_id = producer.send("orders", {"order_id": 101, "price": 49.99})
-            print(f"Published order at offset {msg_id.offset}")
+    Supports:
+    - Direct connection to a known broker (Phases 3-7).
+    - Dynamic topic owner lookup via Coordinator (GET_OWNER) and automatic
+      reconnect with exponential backoff on NOT_OWNER, FENCED, or socket drop (Phase 9).
     """
 
-    def __init__(self, broker_host: str, broker_port: int, timeout: float = 10.0):
+    def __init__(
+        self,
+        broker_host: Optional[str] = None,
+        broker_port: Optional[int] = None,
+        timeout: float = 10.0,
+        coordinator_host: Optional[str] = None,
+        coordinator_port: Optional[int] = None,
+        fallback_brokers: Optional[List[Tuple[str, int]]] = None,
+        max_retries: int = 20,
+        base_backoff_sec: float = 0.1
+    ):
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.timeout = timeout
-        self._tcp_client: Optional[TCPClient] = None
+        self.coordinator_host = coordinator_host
+        self.coordinator_port = coordinator_port
+        self.fallback_brokers = list(fallback_brokers) if fallback_brokers else []
+        self.max_retries = max_retries
+        self.base_backoff_sec = base_backoff_sec
 
-    def connect(self) -> None:
-        """Establishes TCP connection with the broker."""
-        self._tcp_client = TCPClient(self.broker_host, self.broker_port, timeout=self.timeout)
+        self._tcp_client: Optional[TCPClient] = None
+        self._auto_reconnect = (coordinator_host is not None) or bool(self.fallback_brokers)
+        self.reconnect_count: int = 0
+
+    def connect(self, topic: Optional[str] = None) -> None:
+        """Establishes TCP connection with the target or discovered owning broker."""
+        if self.broker_host and self.broker_port:
+            self._connect_to(self.broker_host, self.broker_port)
+            return
+
+        if topic and self.coordinator_host and self.coordinator_port:
+            owner = lookup_topic_owner(self.coordinator_host, self.coordinator_port, topic, timeout=self.timeout)
+            if owner:
+                self._connect_to(owner[0], owner[1])
+                return
+
+        if self.fallback_brokers:
+            host, port = self.fallback_brokers[0]
+            self._connect_to(host, port)
+
+    def _connect_to(self, host: str, port: int) -> None:
+        if self._tcp_client:
+            self._tcp_client.close()
+        self.broker_host = host
+        self.broker_port = port
+        self._tcp_client = TCPClient(host, port, timeout=self.timeout)
         self._tcp_client.connect()
 
-    def send(self, topic: str, payload: Union[str, Dict[str, Any], bytes], timeout: Optional[float] = None) -> MessageId:
-        """Publishes a message to the specified topic and waits for broker durability confirmation.
-        
-        Args:
-            topic: Destination topic name.
-            payload: Payload string, dictionary (auto-serialized to JSON), or UTF-8 bytes.
-            timeout: Optional per-request timeout in seconds.
-            
-        Returns:
-            MessageId: The unique (topic, offset) identifier assigned to this message.
-            
-        Raises:
-            PublishError: If the broker or storage rejects the publication.
-            ConnectionError: If network connection drops.
-        """
-        if not self._tcp_client:
-            raise ConnectionError("Producer is not connected. Call connect() first.")
+    def _resolve_and_reconnect(self, topic: str, attempt: int, hint_address: Optional[str] = None) -> bool:
+        """Attempts to discover the current topic owner and reconnect."""
+        if self._tcp_client:
+            self._tcp_client.close()
+            self._tcp_client = None
 
+        backoff = min(self.base_backoff_sec * (1.5 ** attempt), 0.5)
+        time.sleep(backoff)
+
+        candidates: List[Tuple[str, int]] = []
+        if hint_address:
+            try:
+                candidates.append(parse_broker_address(hint_address))
+            except Exception:
+                pass
+
+        if self.coordinator_host and self.coordinator_port:
+            owner = lookup_topic_owner(self.coordinator_host, self.coordinator_port, topic, timeout=self.timeout)
+            if owner and owner not in candidates:
+                candidates.append(owner)
+
+        for fb in self.fallback_brokers:
+            if fb not in candidates:
+                candidates.append(fb)
+
+        for host, port in candidates:
+            try:
+                self._connect_to(host, port)
+                self.reconnect_count += 1
+                return True
+            except Exception:
+                continue
+
+        return False
+
+    def send(self, topic: str, payload: Union[str, Dict[str, Any], bytes], timeout: Optional[float] = None) -> MessageId:
+        """Publishes a message to `topic`, automatically failing over if auto-reconnect is enabled."""
         if isinstance(payload, dict):
             payload_str = json.dumps(payload)
         elif isinstance(payload, bytes):
@@ -61,38 +119,60 @@ class Producer:
         else:
             payload_str = str(payload)
 
-        req_id = str(uuid.uuid4())
-        req = {
-            "type": Commands.PUBLISH,
-            "req_id": req_id,
-            "topic": topic,
-            "payload": payload_str
-        }
+        if not self._tcp_client:
+            if not self._auto_reconnect:
+                raise ConnectionError("Producer is not connected. Call connect() first.")
+            self._resolve_and_reconnect(topic, attempt=0)
 
-        resp = self._tcp_client.send_request(req, timeout=timeout)
+        attempts = self.max_retries if self._auto_reconnect else 1
+        last_error: Optional[Exception] = None
 
-        if resp.get("type") == Commands.ERROR:
-            raise PublishError(
-                error_code=resp.get("error_code", ErrorCodes.INTERNAL_ERROR),
-                message=resp.get("message", "Unknown broker error")
-            )
+        for attempt in range(attempts):
+            if not self._tcp_client:
+                self._resolve_and_reconnect(topic, attempt)
+                continue
 
-        if resp.get("type") != Commands.PUBLISH_OK:
-            raise PublishError(
-                error_code=ErrorCodes.INTERNAL_ERROR,
-                message=f"Unexpected response type: {resp.get('type')}"
-            )
+            req = {
+                "type": Commands.PUBLISH,
+                "req_id": str(uuid.uuid4()),
+                "topic": topic,
+                "payload": payload_str
+            }
 
-        raw_msg_id = resp.get("message_id")
-        if isinstance(raw_msg_id, dict):
-            return MessageId.from_dict(raw_msg_id)
-        elif isinstance(raw_msg_id, str):
-            return MessageId.from_string(raw_msg_id)
-        else:
-            raise PublishError(
-                error_code=ErrorCodes.INTERNAL_ERROR,
-                message=f"Malformed message_id in response: {raw_msg_id}"
-            )
+            try:
+                resp = self._tcp_client.send_request(req, timeout=timeout)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_error = e
+                if not self._auto_reconnect:
+                    raise
+                self._resolve_and_reconnect(topic, attempt)
+                continue
+
+            if resp.get("type") == Commands.ERROR:
+                err_code = resp.get("error_code", ErrorCodes.INTERNAL_ERROR)
+                err_msg = resp.get("message", "Unknown broker error")
+                if self._auto_reconnect and err_code in (ErrorCodes.NOT_OWNER, ErrorCodes.FENCED):
+                    last_error = PublishError(err_code, err_msg)
+                    self._resolve_and_reconnect(topic, attempt, hint_address=resp.get("owner_address"))
+                    continue
+                raise PublishError(error_code=err_code, message=err_msg)
+
+            if resp.get("type") != Commands.PUBLISH_OK:
+                raise PublishError(
+                    error_code=ErrorCodes.INTERNAL_ERROR,
+                    message=f"Unexpected response type: {resp.get('type')}"
+                )
+
+            raw_msg_id = resp.get("message_id")
+            if isinstance(raw_msg_id, dict):
+                return MessageId.from_dict(raw_msg_id)
+            elif isinstance(raw_msg_id, str):
+                return MessageId.from_string(raw_msg_id)
+            raise PublishError(ErrorCodes.INTERNAL_ERROR, f"Malformed message_id in response: {raw_msg_id}")
+
+        if isinstance(last_error, PublishError):
+            raise last_error
+        raise ConnectionError(f"Producer failed to publish to '{topic}' after {attempts} attempts: {last_error}")
 
     def close(self) -> None:
         """Closes the TCP connection to the broker."""
@@ -106,4 +186,3 @@ class Producer:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
-
