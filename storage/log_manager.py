@@ -38,12 +38,16 @@ class LogManager:
         self._lock = threading.Lock()
         # topic -> file handle
         self._file_handles: Dict[str, Any] = {}
-        # topic -> in-memory index: list of file seek positions [pos_0, pos_1, pos_2, ...]
+        # topic -> in-memory index: list of file seek positions relative to base_offset
         self._offset_positions: Dict[str, List[int]] = {}
+        # topic -> earliest offset retained on disk (0 initially, advances on retention deletion)
+        self._base_offsets: Dict[str, int] = {}
         # topic -> highest fencing token seen
         self._highest_tokens: Dict[str, int] = {}
         # topic -> last appended offset
         self._last_offsets: Dict[str, int] = {}
+        # topic -> cached metadata dict (retention rules, subscriptions)
+        self._topic_meta: Dict[str, Dict[str, Any]] = {}
 
         self._recover_all_topics()
 
@@ -66,19 +70,34 @@ class LogManager:
     def _load_topic(self, topic: str) -> None:
         """Scans the topic log file to reconstruct offsets and reads metadata for fencing tokens."""
         meta_file = self._meta_path(topic)
+        meta: Dict[str, Any] = {}
         highest_token = 0
+        meta_last_offset = -1
+        meta_base_offset = 0
         if os.path.exists(meta_file):
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                     highest_token = int(meta.get("highest_fencing_token", 0))
+                    meta_last_offset = int(meta.get("last_offset", -1))
+                    meta_base_offset = int(meta.get("base_offset", 0))
             except Exception:
+                meta = {}
                 highest_token = 0
+
         self._highest_tokens[topic] = highest_token
+        self._topic_meta[topic] = {
+            "topic": topic,
+            "highest_fencing_token": highest_token,
+            "subscriptions": list(meta.get("subscriptions", [])),
+            "retention_time_sec": meta.get("retention_time_sec"),
+            "retention_size_bytes": meta.get("retention_size_bytes"),
+        }
 
         log_file = self._log_path(topic)
         positions: List[int] = []
-        last_offset = -1
+        base_offset: Optional[int] = None
+        last_offset = meta_last_offset
 
         if os.path.exists(log_file):
             with open(log_file, "rb") as f:
@@ -93,11 +112,23 @@ class LogManager:
                     if len(rec_bytes) < rec_len:
                         break  # Incomplete record write on crash; stop at last valid record
 
+                    try:
+                        rec = json.loads(rec_bytes.decode("utf-8"))
+                        rec_offset = int(rec["offset"])
+                    except Exception:
+                        break
+
+                    if base_offset is None:
+                        base_offset = rec_offset
                     positions.append(pos)
-                    last_offset += 1
+                    last_offset = rec_offset
                     pos = f.tell()
 
+        if base_offset is None:
+            base_offset = (last_offset + 1) if last_offset >= 0 else meta_base_offset
+
         self._offset_positions[topic] = positions
+        self._base_offsets[topic] = base_offset
         self._last_offsets[topic] = last_offset
 
         # Open in append+binary mode with write access
@@ -106,13 +137,20 @@ class LogManager:
         self._file_handles[topic] = handle
 
     def _persist_meta(self, topic: str) -> None:
-        """Atomically saves topic metadata (highest fencing token) with fsync."""
+        """Atomically saves topic metadata (fencing token, offsets, retention, subscriptions) with fsync."""
         meta_file = self._meta_path(topic)
         temp_file = f"{meta_file}.tmp"
+        existing = self._topic_meta.get(topic, {})
         data = {
             "topic": topic,
-            "highest_fencing_token": self._highest_tokens[topic]
+            "highest_fencing_token": self._highest_tokens.get(topic, 0),
+            "base_offset": self._base_offsets.get(topic, 0),
+            "last_offset": self._last_offsets.get(topic, -1),
+            "subscriptions": list(existing.get("subscriptions", [])),
+            "retention_time_sec": existing.get("retention_time_sec"),
+            "retention_size_bytes": existing.get("retention_size_bytes"),
         }
+        self._topic_meta[topic] = data
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f)
             f.flush()
@@ -123,13 +161,20 @@ class LogManager:
         if topic not in self._file_handles:
             self._load_topic(topic)
 
-    def append(self, topic: str, payload: str, fencing_token: int) -> int:
+    def append(
+        self,
+        topic: str,
+        payload: str,
+        fencing_token: int,
+        timestamp: Optional[float] = None
+    ) -> int:
         """Appends a message to the topic log with fsync durability and fencing check.
         
         Args:
             topic: Target topic name.
             payload: Raw string or serialized payload.
             fencing_token: The fencing token of the broker attempting this append.
+            timestamp: Optional creation timestamp (defaults to time.time()).
             
         Returns:
             int: The assigned continuous 0-based offset of the message.
@@ -154,10 +199,11 @@ class LogManager:
                 self._persist_meta(topic)
 
             next_offset = self._last_offsets.get(topic, -1) + 1
+            msg_ts = timestamp if timestamp is not None else time.time()
             record = {
                 "offset": next_offset,
                 "payload": payload,
-                "timestamp": time.time(),
+                "timestamp": msg_ts,
                 "fencing_token": fencing_token
             }
             record_bytes = json.dumps(record).encode("utf-8")
@@ -194,23 +240,28 @@ class LogManager:
         with self._lock:
             self._ensure_topic_initialized(topic)
 
-            positions = self._offset_positions.get(topic, [])
-            total_msgs = len(positions)
-
-            if from_offset < 0 or from_offset >= total_msgs:
-                # Nothing to read
+            if from_offset < 0:
                 return [], from_offset
 
-            end_offset = min(from_offset + max_count, total_msgs)
-            start_pos = positions[from_offset]
+            positions = self._offset_positions.get(topic, [])
+            base = self._base_offsets.get(topic, 0)
+            effective_from = max(from_offset, base)
+            start_idx = effective_from - base
+
+            if start_idx >= len(positions):
+                # Nothing to read
+                return [], effective_from
+
+            end_idx = min(start_idx + max_count, len(positions))
+            start_pos = positions[start_idx]
 
             log_file = self._log_path(topic)
             messages = []
 
             with open(log_file, "rb") as f:
                 f.seek(start_pos)
-                current_offset = from_offset
-                while current_offset < end_offset:
+                idx = start_idx
+                while idx < end_idx:
                     header = f.read(RECORD_HEADER_SIZE)
                     if len(header) < RECORD_HEADER_SIZE:
                         break
@@ -221,10 +272,16 @@ class LogManager:
 
                     record = json.loads(rec_bytes.decode("utf-8"))
                     messages.append(record)
-                    current_offset += 1
+                    idx += 1
 
-            next_offset = from_offset + len(messages)
+            next_offset = effective_from + len(messages)
             return messages, next_offset
+
+    def base_offset(self, topic: str) -> int:
+        """Returns the earliest retained offset still stored on disk for the topic."""
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+            return self._base_offsets.get(topic, 0)
 
     def last_offset(self, topic: str) -> int:
         """Returns the latest appended offset for the topic, or -1 if empty."""
@@ -278,6 +335,13 @@ class LogManager:
                 os.fsync(f.fileno())
             os.replace(temp_file, cursor_file)
 
+            # Register subscription in topic metadata so retention tracks all subscribers
+            meta = self._topic_meta.setdefault(topic, {"subscriptions": []})
+            subs = meta.setdefault("subscriptions", [])
+            if subscription not in subs:
+                subs.append(subscription)
+                self._persist_meta(topic)
+
     def load_cursor(self, topic: str, subscription: str) -> Cursor:
         """Loads subscription cursor from disk. Returns default Cursor if none exists."""
         with self._lock:
@@ -297,25 +361,10 @@ class LogManager:
         """Persists topic metadata such as subscription list and retention settings."""
         with self._lock:
             self._ensure_topic_initialized(topic)
-            meta_file = self._meta_path(topic)
-            existing = {}
-            if os.path.exists(meta_file):
-                try:
-                    with open(meta_file, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except Exception:
-                    pass
-
+            existing = self._topic_meta.get(topic, {})
             existing.update(metadata)
-            existing["topic"] = topic
-            existing["highest_fencing_token"] = self._highest_tokens.get(topic, 0)
-
-            temp_file = f"{meta_file}.tmp"
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(existing, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_file, meta_file)
+            self._topic_meta[topic] = existing
+            self._persist_meta(topic)
 
     def get_topic_metadata(self, topic: str) -> Dict[str, Any]:
         """Retrieves topic metadata."""
@@ -331,7 +380,162 @@ class LogManager:
             return {
                 "topic": topic,
                 "highest_fencing_token": self._highest_tokens.get(topic, 0),
-                "subscriptions": []
+                "base_offset": self._base_offsets.get(topic, 0),
+                "last_offset": self._last_offsets.get(topic, -1),
+                "subscriptions": list(self._topic_meta.get(topic, {}).get("subscriptions", [])),
+                "retention_time_sec": self._topic_meta.get(topic, {}).get("retention_time_sec"),
+                "retention_size_bytes": self._topic_meta.get(topic, {}).get("retention_size_bytes"),
+            }
+
+    def set_retention_policy(
+        self,
+        topic: str,
+        retention_time_sec: Optional[float] = None,
+        retention_size_bytes: Optional[int] = None
+    ) -> None:
+        """Configures time-based and/or size-based retention rules for a topic."""
+        self.save_topic_metadata(topic, {
+            "retention_time_sec": retention_time_sec,
+            "retention_size_bytes": retention_size_bytes
+        })
+
+    def _discover_subscriptions(self, topic: str) -> List[str]:
+        """Finds all subscriptions known for a topic via metadata and cursor files on disk."""
+        subs: Set[str] = set(self._topic_meta.get(topic, {}).get("subscriptions", []))
+        prefix = f"{topic}_"
+        suffix = ".cursor.json"
+        for fname in os.listdir(self.data_dir):
+            if fname.startswith(prefix) and fname.endswith(suffix):
+                sub_name = fname[len(prefix):-len(suffix)]
+                if sub_name:
+                    subs.add(sub_name)
+        return sorted(subs)
+
+    def _load_cursor_unlocked(self, topic: str, subscription: str) -> Cursor:
+        cursor_file = self._cursor_path(topic, subscription)
+        if not os.path.exists(cursor_file):
+            return Cursor(mark_delete_position=-1, individual_acks=set())
+        try:
+            with open(cursor_file, "r", encoding="utf-8") as f:
+                return Cursor.from_dict(json.load(f))
+        except Exception:
+            return Cursor(mark_delete_position=-1, individual_acks=set())
+
+    def apply_retention(
+        self,
+        topic: str,
+        retention_time_sec: Optional[float] = None,
+        retention_size_bytes: Optional[int] = None,
+        now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Safely deletes old log entries that are past retention AND acked by every subscription.
+        
+        Golden Rule of Pulsar Retention:
+        A message is deleted ONLY IF:
+          1. It is past the time-based and/or size-based retention policy, AND
+          2. Every active subscription has acknowledged at or past that offset
+             (offset <= min(cursor.mark_delete_position for all subscriptions)).
+        """
+        with self._lock:
+            self._ensure_topic_initialized(topic)
+
+            meta = self._topic_meta.get(topic, {})
+            eff_time = retention_time_sec if retention_time_sec is not None else meta.get("retention_time_sec")
+            eff_size = retention_size_bytes if retention_size_bytes is not None else meta.get("retention_size_bytes")
+
+            subs = self._discover_subscriptions(topic)
+            if subs:
+                cursors = [self._load_cursor_unlocked(topic, s) for s in subs]
+                safe_acked_upto = min(c.mark_delete_position for c in cursors)
+            else:
+                safe_acked_upto = self._last_offsets.get(topic, -1)
+
+            log_file = self._log_path(topic)
+            current_bytes = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+
+            if eff_time is None and eff_size is None:
+                return {
+                    "deleted_count": 0,
+                    "new_base_offset": self._base_offsets.get(topic, 0),
+                    "remaining_count": len(self._offset_positions.get(topic, [])),
+                    "remaining_bytes": current_bytes,
+                    "safe_acked_upto": safe_acked_upto
+                }
+
+            # Read raw records from head to evaluate retention eligibility
+            records: List[Tuple[int, float, bytes]] = []
+            if os.path.exists(log_file):
+                with open(log_file, "rb") as f:
+                    while True:
+                        header = f.read(RECORD_HEADER_SIZE)
+                        if len(header) < RECORD_HEADER_SIZE:
+                            break
+                        rec_len = struct.unpack(RECORD_HEADER_FORMAT, header)[0]
+                        rec_bytes = f.read(rec_len)
+                        if len(rec_bytes) < rec_len:
+                            break
+                        rec = json.loads(rec_bytes.decode("utf-8"))
+                        records.append((int(rec["offset"]), float(rec["timestamp"]), header + rec_bytes))
+
+            current_time = now if now is not None else time.time()
+            remaining_bytes = sum(len(raw) for _, _, raw in records)
+            delete_count = 0
+
+            for rec_offset, rec_ts, raw_frame in records:
+                # Never delete unacknowledged data!
+                if rec_offset > safe_acked_upto:
+                    break
+
+                past_time = eff_time is not None and (current_time - rec_ts) >= eff_time
+                past_size = eff_size is not None and remaining_bytes > eff_size
+
+                if not (past_time or past_size):
+                    break
+
+                delete_count += 1
+                remaining_bytes -= len(raw_frame)
+
+            if delete_count > 0:
+                kept_records = records[delete_count:]
+                temp_log = f"{log_file}.tmp"
+                new_positions: List[int] = []
+
+                with open(temp_log, "wb") as f:
+                    pos = 0
+                    for _, _, raw_frame in kept_records:
+                        new_positions.append(pos)
+                        f.write(raw_frame)
+                        pos += len(raw_frame)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Swap log file atomically and reopen append handle
+                old_handle = self._file_handles.pop(topic, None)
+                if old_handle:
+                    try:
+                        old_handle.close()
+                    except Exception:
+                        pass
+
+                os.replace(temp_log, log_file)
+                new_handle = open(log_file, "a+b")
+                new_handle.seek(0, os.SEEK_END)
+                self._file_handles[topic] = new_handle
+
+                self._offset_positions[topic] = new_positions
+                if kept_records:
+                    self._base_offsets[topic] = kept_records[0][0]
+                else:
+                    self._base_offsets[topic] = self._last_offsets.get(topic, -1) + 1
+
+                self._persist_meta(topic)
+
+            return {
+                "deleted_count": delete_count,
+                "new_base_offset": self._base_offsets.get(topic, 0),
+                "remaining_count": len(self._offset_positions.get(topic, [])),
+                "remaining_bytes": remaining_bytes,
+                "safe_acked_upto": safe_acked_upto
             }
 
     def close(self) -> None:

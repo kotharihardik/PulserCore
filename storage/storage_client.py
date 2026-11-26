@@ -161,3 +161,55 @@ class StorageClient:
             individual_acks=set(int(x) for x in resp.get("individual_acks", []))
         )
 
+    def set_retention(
+        self,
+        topic: str,
+        retention_time_sec: Optional[float] = None,
+        retention_size_bytes: Optional[int] = None
+    ) -> None:
+        """Configures retention rules for a topic on the storage node."""
+        if not self._tcp_client:
+            raise ConnectionError("StorageClient is not connected.")
+
+        req = {
+            "type": Commands.SET_RETENTION,
+            "req_id": str(uuid.uuid4()),
+            "topic": topic,
+            "retention_time_sec": retention_time_sec,
+            "retention_size_bytes": retention_size_bytes
+        }
+        resp = self._tcp_client.send_request(req)
+        if resp.get("type") == Commands.ERROR:
+            raise RuntimeError(f"Storage set_retention failed: {resp.get('message')}")
+
+    def apply_retention(
+        self,
+        topic: str,
+        retention_time_sec: Optional[float] = None,
+        retention_size_bytes: Optional[int] = None,
+        now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Triggers retention cleanup on the storage node and returns deletion statistics."""
+        if not self._tcp_client:
+            raise ConnectionError("StorageClient is not connected.")
+
+        req = {
+            "type": Commands.APPLY_RETENTION,
+            "req_id": str(uuid.uuid4()),
+            "topic": topic,
+            "retention_time_sec": retention_time_sec,
+            "retention_size_bytes": retention_size_bytes,
+            "now": now
+        }
+        resp = self._tcp_client.send_request(req)
+        if resp.get("type") == Commands.ERROR:
+            raise RuntimeError(f"Storage apply_retention failed: {resp.get('message')}")
+
+        return {
+            "deleted_count": int(resp.get("deleted_count", 0)),
+            "new_base_offset": int(resp.get("new_base_offset", 0)),
+            "remaining_count": int(resp.get("remaining_count", 0)),
+            "remaining_bytes": int(resp.get("remaining_bytes", 0)),
+            "safe_acked_upto": resp.get("safe_acked_upto")
+        }
+

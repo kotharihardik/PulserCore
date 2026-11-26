@@ -106,6 +106,37 @@ class StorageServer(BaseTCPServer):
             except Exception as e:
                 return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
 
+        elif cmd == Commands.SET_RETENTION:
+            topic = request.get("topic")
+            if not topic:
+                return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic")
+
+            try:
+                self.log_manager.set_retention_policy(
+                    topic,
+                    retention_time_sec=request.get("retention_time_sec"),
+                    retention_size_bytes=request.get("retention_size_bytes")
+                )
+                return make_ok(req_id, Commands.SET_RETENTION_OK, topic=topic)
+            except Exception as e:
+                return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
+
+        elif cmd == Commands.APPLY_RETENTION:
+            topic = request.get("topic")
+            if not topic:
+                return make_error(req_id, ErrorCodes.BAD_REQUEST, "Missing topic")
+
+            try:
+                stats = self.log_manager.apply_retention(
+                    topic,
+                    retention_time_sec=request.get("retention_time_sec"),
+                    retention_size_bytes=request.get("retention_size_bytes"),
+                    now=request.get("now")
+                )
+                return make_ok(req_id, Commands.APPLY_RETENTION_OK, topic=topic, **stats)
+            except Exception as e:
+                return make_error(req_id, ErrorCodes.INTERNAL_ERROR, str(e))
+
         return make_error(req_id, ErrorCodes.BAD_REQUEST, f"Unknown storage command: {cmd}")
 
     def stop(self) -> None:
